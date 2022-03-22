@@ -1,0 +1,213 @@
+import os
+
+from numpy.core.fromnumeric import put
+import epics
+import time
+import json
+import tqdm
+import logging
+import datetime
+import numpy as np
+import matplotlib.pyplot as plt
+
+from epics import caget as get_pv
+from epics import caput as put_pv
+from epics import caget_many
+from andor_detector import AndorDetector
+
+# andor = AndorDetector('/net/s7data/export/7IDSprayimage/2021.11/andor_data')
+andor = AndorDetector('/gypsum_data')
+
+logging.basicConfig(
+    format="%(asctime)s %(message)s",
+    level=logging.INFO)
+
+
+def get_scan_id(fname="scan_id.txt"):
+    if not os.path.isfile(fname):
+        with open(fname, "w") as f:
+            f.write("%d\n" % 1)
+        return 1
+
+    with open(fname, "r+") as f:
+        for line in f:
+            pass
+        current_group_id = int(line)
+        return current_group_id + 1
+
+
+def write_scan_id(scan_id, fname="scan_id.txt"):
+    with open(fname, "r+") as f:
+        f.write("%d\n" % scan_id)
+
+
+def record_pvs(pv_info=None):
+    pv_list = [
+        "7idb:m2.VAL",          # chamber z
+        "7idb:m17.VAL",         # translation
+        "7idb:m6.VAL",          # focus
+        "7idb:m10.RBV",         # ccdx
+        "7idb:m9.RBV",          # ccdz
+        "7idb:m22.RBV",         # samx
+        "7idb:m1.RBV",          # chamberx
+        # "cssi_smaract:m1.RBV",      # pz
+        # "cssi_smaract:m2.RBV",      # px
+        # "cssi_smaract:m3.RBV",      # pz
+        # "cssi_smaract:m5.RBV",      # rotate
+        "S:SRcurrentAI",            # ring current
+        "7idb:m17.RBV",             # andor focus
+        "7idb:m2.RBV",              # filterbox rotation angle
+        "ID07us:Gap.VAL",           # 7idb gap value
+        "ID07ds:MainCurrentRdbk.VAL",  # helical scu current
+        "ID07us:TotalPower.VAL",        # power
+        "ID07us:Energy.VAL",         # energy
+
+        "7idb_slits:m1.VAL",
+        "7idb_slits:m2.VAL",
+        "7idb_slits:m3.VAL",
+        "7idb_slits:m4.VAL",
+
+        "7idb_slits:m9.VAL",
+        "7idb_slits:m10.VAL",
+        "7idb_slits:m11.VAL",
+        "7idb_slits:m12.VAL",
+    ]
+
+    values = caget_many(pv_list, timeout=10)
+
+    scan_id = get_scan_id()
+    scan_time = datetime.datetime.now().isoformat()
+    value_dict = {
+	    "scan_id": scan_id,
+	    "time": scan_time}
+
+    for key, val in zip(pv_list, values):
+        value_dict[key] = val
+    
+    if pv_info is not None:
+    	value_dict.update(pv_info)
+
+    save_name = os.path.join("motor_position", "S%04d.txt" % scan_id) 
+    with open(save_name, "a+") as f:
+        json.dump(value_dict, f, indent=4)
+
+
+def close_shutter():
+    put_pv("7ida:rShtrA:Close", 1, wait=True)
+    while get_pv("PB:07ID:STA_A_FES_CLSD_PL.VAL") != 1:
+        time.sleep(0.1)
+    logging.info('shutter is closed.')
+    return True 
+
+
+def open_shutter():
+    put_pv("7ida:rShtrA:Open", 1, wait=True)
+    while get_pv("PB:07ID:STA_A_FES_CLSD_PL.VAL") != 0:
+        time.sleep(0.1)
+    logging.info('shutter is open.')
+    return True
+
+
+def take_image(sample_name, num_img, exp_time, control_shutter=False):
+    group_id = get_scan_id()
+
+    pv_info = {
+        'sample_name': sample_name,
+        'num_img': num_img,
+        'exp_time': exp_time,
+        'control_shutter': False
+    }
+
+    record_pvs(pv_info)
+
+    andor.switch_mode(new_mode='fixed_number',  sample_name=sample_name,
+                      num_img=num_img, exp_time=exp_time, group_id=group_id)
+    if control_shutter:
+        open_shutter()
+
+    logging.info(f'start acquisition: {group_id:04d}, {sample_name}')
+    andor.acquire()
+
+    if control_shutter:
+        close_shutter()
+
+    write_scan_id(group_id)
+
+
+def set_slits(name='roller', blade='up', pos='in', zero_pos=0.0, offset=2.0):
+    if pos == 'in':
+        target = zero_pos
+    elif pos == 'out':
+        target = zero_pos + offset * ([-1, 1][blade == 'up'])
+
+    if name == 'roller' and blade == 'down':
+        pv = '7idb_slits:m11.VAL'
+    elif name == 'roller' and blade == 'up':
+        pv = '7idb_slits:m12.VAL'
+    elif name == 'GeAs' and blade == 'down':
+        pv = '7idb_slits:m3.VAL'
+    elif name == 'GeAs' and blade == 'up':
+        pv = '7idb_slits:m4.VAL'
+
+    put_pv(pv, target, wait=True)
+
+
+def take_image_with_bkg(sample_name,num_img, exp_time, blade, gaplength=2, zero_pos=0):
+    open_shutter()
+
+    # bkg before exposure
+    set_slits(name="roller", blade='down', pos='out', zero_pos=0.0, offset=2.0)
+    set_slits(name="roller", blade='up', pos='out', zero_pos=0.0, offset=2.0)
+    set_slits(name="GeAs", blade='down', pos='out', zero_pos=0.0, offset=2.0)
+    set_slits(name="GeAs", blade='up', pos='out', zero_pos=0.0, offset=2.0)
+    sample_name2 = sample_name + '_bkgb'
+    take_image(sample_name2, 20, exp_time, control_shutter=False)
+
+    # sample
+    set_slits(name="roller", blade=blade, pos='in', zero_pos=zero_pos, offset=2.0)
+    # Geasblade='up' if blade=='down' else 'down'
+    # set_slits(name="GeAs", blade=Geasblade, pos='in', zero_pos=zero_pos, offset=gaplength)
+
+    sample_name2 = sample_name + '_sample'
+    take_image(sample_name2, num_img, exp_time, control_shutter=False)
+
+    # bkg after exposure
+    set_slits(name="roller", blade='down', pos='out', zero_pos=0.0, offset=2.0)
+    set_slits(name="roller", blade='up', pos='out', zero_pos=0.0, offset=2.0)
+    set_slits(name="GeAs", blade='down', pos='out', zero_pos=0.0, offset=2.0)
+    set_slits(name="GeAs", blade='up', pos='out', zero_pos=0.0, offset=2.0)
+    sample_name2 = sample_name + '_bkga'
+    take_image(sample_name2, 20, exp_time, control_shutter=False)
+
+    close_shutter()
+
+    # camera noise
+    sample_name2 = sample_name + '_bkgc'
+    set_slits(name="roller", blade=blade, pos='in', zero_pos=zero_pos, offset=2.0)
+    take_image(sample_name2, 20, exp_time, control_shutter=False)
+
+    andor.switch_mode(new_mode='standby')
+
+
+def scan_slits(sample_name):
+    down_pv = "7idb_slits:m11.VAL"
+    put_pv(down_pv, 0)
+
+    upper_pv = "7idb_slits:m12.VAL"
+    pos_list = np.linspace(0.030, -0.002, 33)
+    chamberx = get_pv("7idb:m1.RBV")
+    open_shutter()
+
+    for n in range(len(pos_list)):
+        put_pv(upper_pv, pos_list[n], wait=True)
+        exp_time = andor.get_optimal_exposure_time()
+        logging.info(f'exposure time: {exp_time}s')
+        sample_name2 = sample_name + "_s%.3fmm" % pos_list[n] + "_x%.3fmm" % chamberx 
+        take_image(sample_name2, 30, exp_time, control_shutter=False)
+    
+    close_shutter()
+
+
+
+if __name__ == '__main__':
+    logging.info('Beamline 7IDB')
